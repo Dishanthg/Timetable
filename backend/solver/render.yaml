@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: timetable-solver
+    runtime: python
+    plan: starter
+    rootDir: backend/solver
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: MONGO_URI
+        sync: false
+      - key: MONGO_DB_NAME
+        value: timetable_jayanth
+      - key: SOLVER_WORKERS
+        value: 8
+      - key: AWS_REGION
+        sync: false
+      - key: EC2_INSTANCE_ID
+        sync: false

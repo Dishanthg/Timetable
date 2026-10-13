@@ -1,0 +1,102 @@
+import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
+import Admin from '../../models/Admin.js';
+import Faculty from '../../models/Faculty.js';
+import adminAuth from '../../middleware/adminAuth.js';
+import auth from '../../middleware/auth.js';
+import requireCollegeContext from '../../middleware/collegeScope.js';
+
+const router = Router();
+const protectedRouter = Router();
+protectedRouter.use(auth);
+protectedRouter.use(requireCollegeContext);
+
+// Provide a /me endpoint that requires authentication but NOT tenant context.
+// This allows superadmins (who do not belong to a tenant) to fetch their profile.
+router.get('/me', auth, (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+  res.json(req.user);
+});
+
+// --- Rate Limiter for Login ---
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // limit each IP to 10 login requests per windowMs
+  message: { error: 'Too many login attempts from this IP, please try again after 15 minutes' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { default: false },
+});
+
+// --- User Authentication ---
+router.post('/register', async (req, res) => {
+  try {
+    const { id, name, collegeId } = req.body;
+    if (!collegeId) {
+      return res.status(400).json({ error: 'collegeId is required.' });
+    }
+    const user = new Faculty({ id, name, collegeId });
+    await user.save();
+    res.status(201).json({ message: 'User created successfully' });
+  } catch (error) {
+    res.status(400).json({ error: 'Bad Request' });
+  }
+});
+
+protectedRouter.post('/users/create', adminAuth, async (req, res) => {
+  try {
+    const { id, name } = req.body;
+    const user = new Faculty({ id, name, collegeId: req.collegeId });
+    await user.save();
+    res.status(201).json({ message: 'User created successfully' });
+  } catch (error) {
+    res.status(400).json({ error: 'Bad Request' });
+  }
+});
+
+router.post('/login', loginLimiter, async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const admin = await Admin.findOne({ email });
+        if (!admin) {
+            console.error('Login failed: Admin not found for email', email);
+            return res.status(400).json({ success: false, message: 'Invalid credentials' });
+        }
+        const isMatch = await admin.matchPassword(password);
+        if (!isMatch) {
+            console.error('Login failed: Incorrect password for email', email);
+            return res.status(400).json({ success: false, message: 'Invalid credentials' });
+        }
+        const token = admin.generateAuthToken();
+        const user = admin.toObject();
+        delete user.password;
+        const isProd = process.env.NODE_ENV === 'production';
+        res.cookie('token', token, {
+          httpOnly: true,
+          secure: isProd,
+          sameSite: isProd ? 'none' : 'lax',
+          path: '/',
+        });
+        res.json({ success: true, user });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ success: false, message: 'Internal Server Error' });
+    }
+});
+
+router.post('/logout', (req, res) => {
+    res.clearCookie('token', {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'none',
+        path: '/'
+    }).json({ success: true });
+});
+
+protectedRouter.get('/me', (req, res) => {
+    res.json(req.user);
+});
+
+router.use(protectedRouter);
+
+export default router;

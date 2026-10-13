@@ -1,0 +1,50 @@
+/* Modern Sidebar Styles */
+.sidebar {
+  width: 240px;
+  color: var(--text-primary);
+  padding: var(--space-6) var(--space-2);
+  min-height: calc(100vh - 120px);
+  background: var(--surface-color);
+  margin: var(--space-4) 0 var(--space-4) var(--space-4);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  border: 1px solid var(--border-color);
+}
+
+.sidebar-links {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.sidebar-links li {
+  margin-bottom: var(--space-1);
+}
+
+.sidebar-links a {
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.95rem;
+  font-weight: 500;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  transition: all 0.2s;
+}
+
+.sidebar-links a:hover {
+  background: var(--bg-color);
+  color: var(--primary-color);
+}
+
+.sidebar-links .active {
+  background: var(--bg-color);
+  color: var(--primary-color);
+  font-weight: 600;
+}
+
+.sidebar-links a span {
+  font-size: 1.2rem;
+}

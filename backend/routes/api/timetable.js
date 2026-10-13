@@ -1,0 +1,1056 @@
+import { Router } from 'express';
+// import { fileURLTo__dirname } from 'url';
+import fs from 'fs';
+import Faculty from '../../models/Faculty.js';
+import Subject from '../../models/Subject.js';
+import ClassModel from '../../models/Class.js';
+import ClassSubject from '../../models/ClassSubject.js';
+import TeachingAllocation from '../../models/TeachingAllocation.js';
+import TimetableResult from '../../models/TimetableResult.js';
+import GenerationJob from '../../models/GenerationJob.js';
+import TimetableUserSettings from '../../models/TimetableUserSettings.js';
+import ElectiveSubjectSetting from '../../models/ElectiveSubjectSetting.js';
+import runGenerate from '../../models/lib/runGenerator.js';
+// Removed: import converter from '../../models/lib/convertNewCollegeInputToGeneratorData.js';
+import { prepareGeneratorData } from '../../services/generator/prepareGeneratorData.js';
+import { buildConstraintHealthReport } from '../../services/generator/healthCheck.service.js';
+import auth from '../../middleware/auth.js';
+import { mergeTeacherAvailabilityConstraintConfig } from '../../utils/teacherAvailability.js';
+import { mergeTeacherPreferenceConstraintConfig } from '../../utils/teacherPreferences.js';
+import { exportTimetableExcel } from "../../services/export/timetableExport.service.js";
+import { buildSubjectMap, collectSubjectIdsFromEncodedSubjectId, getComboSubjectDisplayName } from "../../utils/subjectDisplay.js";
+import { normalizeCombo } from "../../utils/comboNormalizer.js";
+import { loadElectiveSettingsForClass, loadElectiveSettings } from "../../services/legacy/legacyAdapter.js";
+import { startEC2, waitForEC2, waitForSolver } from '../../utils/ec2.js';
+
+const SOLVER_BASE_URL = String(process.env.SOLVER_URL || 'http://127.0.0.1:8001').replace(/\/+$/, '');
+
+const serializeJobStatus = (job) => {
+  if (!job) return null;
+  const timeLimitSec = Math.max(
+    0,
+    Number(job?.input?.constraintConfig?.solver?.timeLimitSec) ||
+      Number(job?.payload?.constraintConfig?.solver?.timeLimitSec) ||
+      0
+  );
+  const deadlineAt = timeLimitSec > 0 && job.createdAt
+    ? new Date(new Date(job.createdAt).getTime() + timeLimitSec * 1000)
+    : null;
+  const remainingSec = deadlineAt
+    ? Math.max(0, Math.ceil((deadlineAt.getTime() - Date.now()) / 1000))
+    : null;
+  return {
+    taskId: String(job._id),
+    status: job.status,
+    progress: Number(job.progress || 0),
+    phase: job.phase || "queued",
+    partialData: job.partial_data || null,
+    result: job.result || null,
+    error: job.error || null,
+    cancelRequested: Boolean(job.cancel_requested),
+    timeLimitSec,
+    deadlineAt,
+    remainingSec,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+  };
+};
+
+const filterGeneratorDataForSolver = (generatorData) => {
+  const classes = Array.isArray(generatorData?.classes) ? generatorData.classes : [];
+  const combos = Array.isArray(generatorData?.combos) ? generatorData.combos : [];
+
+  const activeClasses = classes.filter((cls) => {
+    const assigned = Array.isArray(cls?.assigned_teacher_subject_combos)
+      ? cls.assigned_teacher_subject_combos.filter(Boolean)
+      : [];
+    return assigned.length > 0;
+  });
+
+  const skippedClasses = classes.filter((cls) => {
+    const assigned = Array.isArray(cls?.assigned_teacher_subject_combos)
+      ? cls.assigned_teacher_subject_combos.filter(Boolean)
+      : [];
+    return assigned.length === 0;
+  });
+
+  const activeClassIds = new Set(activeClasses.map((cls) => String(cls._id)));
+  const activeComboIds = new Set();
+  const activeCombos = [];
+
+  for (const combo of combos) {
+    const classIds = Array.isArray(combo?.class_ids)
+      ? combo.class_ids.map((classId) => String(classId)).filter((classId) => activeClassIds.has(classId))
+      : [];
+
+    if (classIds.length === 0) continue;
+
+    const comboId = String(combo?._id || "");
+    if (comboId) activeComboIds.add(comboId);
+    activeCombos.push({
+      ...combo,
+      class_ids: classIds,
+    });
+  }
+
+  const filteredClasses = activeClasses.map((cls) => {
+    const assigned = Array.isArray(cls?.assigned_teacher_subject_combos)
+      ? cls.assigned_teacher_subject_combos
+          .map((id) => String(id))
+          .filter((id) => activeComboIds.has(id))
+      : [];
+    return {
+      ...cls,
+      assigned_teacher_subject_combos: assigned,
+    };
+  });
+
+  return {
+    ...generatorData,
+    classes: filteredClasses,
+    combos: activeCombos,
+    skippedClasses,
+  };
+};
+
+
+const protectedRouter = Router();
+protectedRouter.use(auth);
+
+// --- Timetable Settings (per-user, per-college) ---
+protectedRouter.get('/timetable-settings', async (req, res) => {
+  try {
+    const doc = await TimetableUserSettings.findOne({
+      collegeId: req.collegeId,
+      userId: req.user?._id,
+    }).lean();
+
+    res.json({
+      ok: true,
+      settings: doc
+        ? {
+            constraintConfig: doc.constraintConfig ?? null,
+            blockGenerateOnHealthErrors: Boolean(doc.blockGenerateOnHealthErrors),
+            fixedSlots: doc.fixedSlots ?? null,
+            inputMode: doc.inputMode ?? "EXPLICIT",
+            updatedAt: doc.updatedAt,
+          }
+        : {
+            constraintConfig: null,
+            blockGenerateOnHealthErrors: false,
+            fixedSlots: null,
+            inputMode: "EXPLICIT",
+            updatedAt: null,
+          },
+    });
+  } catch (e) {
+    console.error('[GET /timetable-settings] Error:', e);
+    res.status(500).json({ ok: false, error: 'Internal Server Error' });
+  }
+});
+
+protectedRouter.get('/fixed-slot-combos', async (req, res) => {
+  try {
+    const userSettings = await TimetableUserSettings.findOne({
+      collegeId: req.collegeId,
+      userId: req.user?._id,
+    }).lean();
+    const inputMode = userSettings?.inputMode || "EXPLICIT";
+    const generatorData = filterGeneratorDataForSolver(
+      await prepareGeneratorData(req.collegeId, inputMode)
+    );
+
+    // The generator adapter produces snake_case GeneratorCombo objects for the
+    // solver only — translate to a camelCase AssignmentDTO shape at this route
+    // boundary rather than leaking the internal generator format to the client.
+    const [subjectDocs, facultyDocs] = await Promise.all([
+      Subject.find({ collegeId: req.collegeId }).select("name type").lean(),
+      Faculty.find({ collegeId: req.collegeId }).select("name").lean(),
+    ]);
+    const subjectMap = new Map(subjectDocs.map((s) => [String(s._id), s]));
+    const facultyMap = new Map(facultyDocs.map((f) => [String(f._id), f.name]));
+
+    const combos = (generatorData.combos || [])
+      .map((rawCombo) => {
+        const canonical = normalizeCombo(rawCombo);
+        if (!canonical) return null;
+        const subjectDoc = subjectMap.get(canonical.subjectId);
+        return {
+          id: canonical._id,
+          subjectId: canonical.subjectId,
+          subjectName: canonical.subjectName || subjectDoc?.name || null,
+          teacherIds: canonical.facultyIds,
+          teacherNames: canonical.facultyIds.map((id) => facultyMap.get(id) || null).filter(Boolean),
+          classIds: canonical.classIds,
+          mode: canonical.type,
+        };
+      })
+      .filter(Boolean);
+
+    res.json({ inputMode, combos });
+  } catch (e) {
+    console.error("[GET /fixed-slot-combos] Error:", e);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+protectedRouter.put('/timetable-settings', async (req, res) => {
+  try {
+    const { constraintConfig = null, blockGenerateOnHealthErrors = false, fixedSlots = null, inputMode = "EXPLICIT" } =
+      req.body || {};
+
+    const updated = await TimetableUserSettings.findOneAndUpdate(
+      { collegeId: req.collegeId, userId: req.user?._id },
+      {
+        $set: {
+          collegeId: req.collegeId,
+          userId: req.user?._id,
+          constraintConfig,
+          blockGenerateOnHealthErrors: Boolean(blockGenerateOnHealthErrors),
+          fixedSlots,
+          inputMode,
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    ).lean();
+
+    res.json({
+      ok: true,
+      settings: {
+        constraintConfig: updated.constraintConfig ?? null,
+        blockGenerateOnHealthErrors: Boolean(updated.blockGenerateOnHealthErrors),
+        fixedSlots: updated.fixedSlots ?? null,
+        inputMode: updated.inputMode ?? "EXPLICIT",
+        updatedAt: updated.updatedAt,
+      },
+    });
+  } catch (e) {
+    console.error('[PUT /timetable-settings] Error:', e);
+    res.status(500).json({ ok: false, error: 'Internal Server Error' });
+  }
+});
+
+// --- Timetable ---
+protectedRouter.post('/process-new-input', async (req, res) => {
+    try {
+        const collegeId = req.collegeId;
+
+        // 1. Load all TeachingAllocations for this college (canonical source)
+        const allocations = await TeachingAllocation.find({ collegeId }).lean();
+        if (!allocations.length) {
+            return res.json({
+                ok: true,
+                message: "No teaching assignments found for this college.",
+                classAssignments: [],
+            });
+        }
+
+        // 2. Build display maps (subjects + teachers) in one batch
+        const subjectIds = [...new Set(allocations.map(a => String(a.subject || "")).filter(Boolean))];
+        const teacherIds = [...new Set([
+            ...allocations.flatMap(a => (Array.isArray(a.teachers) ? a.teachers : []).map(String)),
+            ...allocations.map(a => String(a.teacher || "")).filter(Boolean),
+        ])];
+
+        const [subjects, teachers] = await Promise.all([
+            subjectIds.length ? Subject.find({ _id: { $in: subjectIds }, collegeId }).select("name type").lean() : [],
+            teacherIds.length ? Faculty.find({ _id: { $in: teacherIds }, collegeId }).select("name").lean() : [],
+        ]);
+
+        const subjectMap = new Map(subjects.map(s => [String(s._id), s]));
+        const teacherMap = new Map(teachers.map(t => [String(t._id), t.name]));
+
+        // 3. Group assignment IDs by class — this is what assignments_only stores
+        //    assignments_only: { [classId]: TeachingAllocation._id[] }
+        const assignmentsOnly = {};
+        const classAssignmentsForFrontend = [];
+
+        // Collect all unique classIds across all allocations
+        const classIds = [...new Set(
+            allocations.flatMap(a => (Array.isArray(a.classIds) ? a.classIds : []).map(String))
+        )];
+
+        for (const classId of classIds) {
+            const classAllocations = allocations.filter(a =>
+                Array.isArray(a.classIds) && a.classIds.map(String).includes(classId)
+            );
+
+            // Store real TeachingAllocation IDs — these can be resolved without hooks
+            assignmentsOnly[classId] = classAllocations.map(a => String(a._id));
+
+            // Build frontend display list
+            const displayCombos = classAllocations.map(a => {
+                const subjectDoc = subjectMap.get(String(a.subject || ""));
+                const allTeacherIds = [
+                    ...(Array.isArray(a.teachers) ? a.teachers.map(String) : []),
+                    ...(a.teacher ? [String(a.teacher)] : []),
+                ].filter((v, i, arr) => arr.indexOf(v) === i);
+
+                const teacherName = allTeacherIds.length
+                    ? allTeacherIds.map(tid => teacherMap.get(tid) || "Unknown Teacher").join(" & ")
+                    : "No Teacher";
+
+                return {
+                    _id: String(a._id),                         // TeachingAllocation id
+                    assignmentId: String(a._id),
+                    teacher: { name: teacherName },
+                    subject: {
+                        name: subjectDoc?.name || "Unknown Subject",
+                        mode: String(subjectDoc?.type || a.type || "theory").toUpperCase(),
+                    },
+                    hoursPerWeek: a.hoursPerWeek,
+                    mode: String(a.type || "NORMAL").toUpperCase(),
+                };
+            });
+
+            classAssignmentsForFrontend.push({
+                classId,
+                combos: displayCombos,
+            });
+        }
+
+        // 4. Save as a TimetableResult with source='assignments'
+        //    assignments_only now holds real IDs that can be populated from TeachingAllocation
+        const newAssignmentName = `Processed Assignments – ${new Date().toLocaleString()}`;
+        const newResult = new TimetableResult({
+            collegeId,
+            name: newAssignmentName,
+            source: "assignments",
+            status: "draft",
+            assignments_only: assignmentsOnly,
+            // combos field intentionally left empty — display data comes from TeachingAllocation
+        });
+        await newResult.save();
+
+        return res.json({
+            ok: true,
+            message: `Successfully processed and saved: "${newAssignmentName}"`,
+            classAssignments: classAssignmentsForFrontend,
+        });
+
+    } catch (err) {
+        console.error("[POST /process-new-input] Error:", err);
+        return res.status(500).json({ ok: false, error: err.message || "Internal Server Error" });
+    }
+});
+
+
+protectedRouter.post('/generate', async (req, res) => {
+    try {
+      // Load user settings to get inputMode
+      const userSettings = await TimetableUserSettings.findOne({
+        collegeId: req.collegeId,
+        userId: req.user?._id,
+      }).lean();
+
+      const { fixedSlots, constraintConfig = {}, solutionCount } = req.body;
+      const inputMode = userSettings?.inputMode || "EXPLICIT";
+      const daysPerWeek = Number(constraintConfig?.schedule?.daysPerWeek) || 6;
+      const hoursPerDay = Number(constraintConfig?.schedule?.hoursPerDay) || 8;
+
+      const generatorData = await prepareGeneratorData(req.collegeId, inputMode);
+      
+      const filteredGeneratorData = filterGeneratorDataForSolver(generatorData);
+      if (String(process.env.DEBUG_LAB_ALLOCATION || "").trim().toLowerCase() === "1" ||
+        String(process.env.DEBUG_LAB_ALLOCATION || "").trim().toLowerCase() === "true") {
+        const classSummary = (filteredGeneratorData.classes || []).map((klass) => ({
+          classId: String(klass._id),
+          className: klass.name || String(klass._id),
+          assignedCombos: Array.isArray(klass.assigned_teacher_subject_combos) ? klass.assigned_teacher_subject_combos.length : 0,
+          subjectHours: klass.subject_hours || {},
+        }));
+        const comboSummary = (filteredGeneratorData.combos || []).map((combo) => ({
+          comboId: String(combo._id),
+          subjectId: String(combo.subject_id),
+          subjectName: combo.subject?.name || String(combo.subject_id),
+          classIds: combo.class_ids || [],
+          facultyIds: combo.faculty_ids || [],
+          hoursPerWeek: combo.hours_per_week,
+        }));
+        console.log("[POST /generate] filtered generator summary", {
+          classes: classSummary,
+          combos: comboSummary,
+        });
+      }
+      const mergedConstraintConfig = mergeTeacherPreferenceConstraintConfig(
+        mergeTeacherAvailabilityConstraintConfig(
+          constraintConfig,
+          filteredGeneratorData.faculties || []
+        ),
+        filteredGeneratorData.faculties || []
+      );
+
+      if (filteredGeneratorData.skippedClasses.length > 0) {
+        console.warn(
+          "[POST /generate] Skipping classes without assigned teacher-subject combos:",
+          filteredGeneratorData.skippedClasses.map((cls) => ({
+            classId: String(cls._id),
+            className: cls.name || String(cls._id),
+          }))
+        );
+      }
+
+      const normalizedSolutionCount = Math.max(
+        1,
+        Math.min(5, Number(solutionCount) || Number(constraintConfig?.solver?.solutionCount) || 5)
+      );
+
+      const job = await GenerationJob.create({
+        collegeId: req.collegeId,
+        status: "pending",
+        phase: "queued",
+        progress: 0,
+        solution_count: normalizedSolutionCount,
+        created_by: req.user?._id || null,
+        input: {
+          fixedSlots: fixedSlots || [],
+          constraintConfig: mergedConstraintConfig,
+          skippedClasses: filteredGeneratorData.skippedClasses.map((cls) => ({
+            classId: String(cls._id),
+            className: cls.name || String(cls._id),
+          })),
+          schedule: {
+            daysPerWeek,
+            hoursPerDay,
+          },
+        },
+        payload: {
+          collegeId: req.collegeId,
+          inputMode,
+          ...filteredGeneratorData,
+          fixedSlots,
+          DAYS_PER_WEEK: daysPerWeek,
+          HOURS_PER_DAY: hoursPerDay,
+          constraintConfig: mergedConstraintConfig,
+          solutionCount: normalizedSolutionCount,
+        },
+      });
+
+      // IMPORTANT (Vercel/serverless): avoid keeping the event loop alive with long-running
+      // fire-and-forget requests. Default to "pull" mode on Vercel: solver polls MongoDB
+      // for pending jobs and starts them itself.
+      const solverStartMode = String(
+        process.env.SOLVER_JOB_START_MODE || (process.env.VERCEL ? "pull" : "push")
+      ).toLowerCase();
+
+      if (solverStartMode === "push") {
+        // If an EC2 instance id is provided and we're in production, ensure the instance is running before calling the solver
+        if (process.env.EC2_INSTANCE_ID && process.env.NODE_ENV === 'production') {
+          try {
+            await startEC2();
+            await waitForEC2();
+            await waitForSolver();
+          } catch (ec2Err) {
+            console.error("[POST /generate] EC2/Solver control failed:", ec2Err);
+            await GenerationJob.findOneAndUpdate({ _id: job._id, collegeId: req.collegeId }, {
+              status: "failed",
+              phase: "error",
+              error: `EC2/Solver control failed: ${String(ec2Err)}`,
+              progress: 100,
+            });
+            return res.status(500).json({ error: "Failed to start EC2 instance or solver." });
+          }
+        }
+
+        const requestBody = {
+          jobId: String(job._id),
+          payload: job.payload,
+        };
+
+        // Best-effort push with a short timeout; do not block the response.
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 2500);
+
+          fetch(`${SOLVER_BASE_URL}/jobs`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody),
+            signal: controller.signal,
+          })
+            .then(() => {})
+            .catch(() => {})
+            .finally(() => clearTimeout(timeoutId));
+        } catch {
+          // ignore
+        }
+      }
+
+      // Return immediately without waiting for solver
+      return res.json({ taskId: String(job._id) });
+    } catch (e) {
+      console.error("Error in /generate:", e);
+      return res.status(500).json({ error: "Internal Server Error" });
+    }
+});
+
+protectedRouter.post('/health-check', async (req, res) => {
+    try {
+      // Load user settings to get inputMode
+      const userSettings = await TimetableUserSettings.findOne({
+        collegeId: req.collegeId,
+        userId: req.user?._id,
+      }).lean();
+
+      const { fixedSlots = [], constraintConfig = {} } = req.body || {};
+      const inputMode = userSettings?.inputMode || "EXPLICIT";
+
+      const generatorData = await prepareGeneratorData(req.collegeId, inputMode);
+      const mergedConstraintConfig = mergeTeacherPreferenceConstraintConfig(
+        mergeTeacherAvailabilityConstraintConfig(
+          constraintConfig,
+          generatorData.faculties || []
+        ),
+        generatorData.faculties || []
+      );
+
+      const report = buildConstraintHealthReport({
+        ...generatorData,
+        fixedSlots,
+        constraintConfig: mergedConstraintConfig,
+      });
+
+      res.json(report);
+    } catch (e) {
+      console.error("Error in /health-check:", e);
+      res.status(500).json({ ok: false, error: "Internal Server Error" });
+    }
+});
+
+protectedRouter.post('/audit', async (req, res) => {
+    try {
+      // Load user settings to get inputMode
+      const userSettings = await TimetableUserSettings.findOne({
+        collegeId: req.collegeId,
+        userId: req.user?._id,
+      }).lean();
+
+      const { fixedSlots, constraintConfig = {} } = req.body || {};
+      const inputMode = userSettings?.inputMode || "EXPLICIT";
+      const daysPerWeek = Number(constraintConfig?.schedule?.daysPerWeek) || 6;
+      const hoursPerDay = Number(constraintConfig?.schedule?.hoursPerDay) || 8;
+
+      const generatorData = await prepareGeneratorData(req.collegeId, inputMode);
+      const filteredGeneratorData = filterGeneratorDataForSolver(generatorData);
+      
+      const mergedConstraintConfig = mergeTeacherPreferenceConstraintConfig(
+        mergeTeacherAvailabilityConstraintConfig(
+          constraintConfig,
+          filteredGeneratorData.faculties || []
+        ),
+        filteredGeneratorData.faculties || []
+      );
+
+      const requestBody = {
+        payload: {
+          collegeId: req.collegeId,
+          inputMode,
+          ...filteredGeneratorData,
+          fixedSlots,
+          DAYS_PER_WEEK: daysPerWeek,
+          HOURS_PER_DAY: hoursPerDay,
+          constraintConfig: mergedConstraintConfig,
+        },
+      };
+
+      const response = await fetch(`${SOLVER_BASE_URL}/audit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+
+      const auditResult = await response.json();
+      res.json(auditResult);
+    } catch (e) {
+      console.error("Error in /audit:", e);
+      res.status(500).json({ ok: false, error: "Internal Server Error" });
+    }
+});
+
+protectedRouter.get('/elective-settings/:classId', async (req, res) => {
+    try {
+        const { classId } = req.params;
+        const settings = await loadElectiveSettingsForClass(req.collegeId, classId);
+
+        const settingsMap = settings.map(setting => ({
+            subjectId: setting.subjectId,
+            teacherCategoryRequirements: setting.teacherCategoryRequirements || {}
+        }));
+
+        res.json(settingsMap);
+    } catch (error) {
+        console.error("Error fetching elective settings:", error);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+    protectedRouter.get('/elective-groups', async (req, res) => {
+      try {
+        const settings = await loadElectiveSettings(req.collegeId);
+
+        const groups = [];
+        const seen = new Set();
+
+        for (const setting of settings || []) {
+          const classId = setting.classId;
+          const subjects = Object.keys(setting.teacherCategoryRequirements || {}).map(String).filter(Boolean);
+          if (!classId || subjects.length === 0) continue;
+
+          subjects.sort();
+          const key = `${classId}|${subjects.join(',')}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          groups.push({ classId, subjects });
+        }
+
+        res.json(groups);
+      } catch (error) {
+        console.error('Error fetching elective groups:', error);
+        res.status(500).json({ error: 'Internal Server Error' });
+      }
+    });
+
+protectedRouter.post('/elective-settings', async (req, res) => {
+    try {
+        const { classId, settings } = req.body;
+        if (!classId || !Array.isArray(settings)) {
+            return res.status(400).json({ error: 'Invalid request body' });
+        }
+
+        await ElectiveSubjectSetting.deleteMany({ class: classId, collegeId: req.collegeId });
+
+        const settingsToInsert = settings.map(setting => ({
+            collegeId: req.collegeId,
+            class: classId,
+            subject: setting.subjectId,
+            teacherCategoryRequirements: setting.teacherCategoryRequirements || {}
+        }));
+
+        if (settingsToInsert.length > 0) {
+            await ElectiveSubjectSetting.insertMany(settingsToInsert);
+        }
+
+        res.status(200).json({ ok: true, message: 'Elective settings saved successfully.' });
+    } catch (error) {
+        console.error('Error saving elective settings:', error);
+        res.status(500).json({ ok: false, error: 'Internal Server Error' });
+    }
+});
+
+protectedRouter.post('/stop-generator/:taskId', (req, res) => {
+  GenerationJob.findOneAndUpdate({ _id: req.params.taskId, collegeId: req.collegeId }, {
+    cancel_requested: true,
+    phase: "cancel_requested",
+  })
+    .then((job) => {
+      if (!job) {
+        return res.status(404).json({ error: "Task not found" });
+      }
+      return res.json({ ok: true, message: `Stop signal recorded for task ${req.params.taskId}` });
+    })
+    .catch(() => res.status(500).json({ error: "Internal Server Error" }));
+});
+
+protectedRouter.get('/generation-status/:taskId', async (req, res) => {
+  try {
+    const job = await GenerationJob.findOne({ _id: req.params.taskId, collegeId: req.collegeId }).lean();
+    if (!job) {
+      return res.status(404).json({ error: "Task not found" });
+    }
+    res.json(serializeJobStatus(job));
+  } catch {
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+protectedRouter.get('/generation-payload/latest', async (req, res) => {
+  try {
+    const job = await GenerationJob.findOne({
+      collegeId: req.collegeId,
+      payload: { $ne: null },
+    }).sort({ updatedAt: -1 }).lean();
+    if (!job) {
+      return res.status(404).json({ error: "No generation payload found." });
+    }
+    res.json({
+      taskId: String(job._id),
+      status: job.status,
+      phase: job.phase,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      payload: job.payload || null,
+      input: job.input || null,
+    });
+  } catch (e) {
+    console.error("[GET /generation-payload/latest] Error:", e);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+protectedRouter.get('/generation-payload/:taskId', async (req, res) => {
+  try {
+    const taskId = String(req.params.taskId || "").trim();
+    if (!taskId || taskId.toLowerCase() === "latest") {
+      return res.status(400).json({ error: "Use /generation-payload/latest for the latest payload." });
+    }
+    const job = await GenerationJob.findOne({ _id: taskId, collegeId: req.collegeId }).lean();
+    if (!job) {
+      return res.status(404).json({ error: "Task not found" });
+    }
+    res.json({
+      taskId: String(job._id),
+      status: job.status,
+      phase: job.phase,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+      payload: job.payload || null,
+      input: job.input || null,
+    });
+  } catch (e) {
+    console.error("[GET /generation-payload/:taskId] Error:", e);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+
+protectedRouter.get('/result/latest', async (req, res) => {
+  console.log("[GET /result/latest] Fetching latest timetable result");
+  try {
+    const latestJob = await GenerationJob.findOne({
+      collegeId: req.collegeId,
+      status: 'completed',
+      result: { $ne: null },
+    }).sort({ updatedAt: -1 }).lean();
+    if (latestJob?.result) {
+      console.log("[GET /result/latest] Found completed generation job result");
+      return res.json(latestJob.result);
+    }
+
+    const r = await TimetableResult.findOne({ collegeId: req.collegeId, source: 'generator' }).sort({ createdAt: -1 }).lean();
+    console.log("[GET /result/latest] Found:", r ? "Yes" : "No");
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+protectedRouter.get('/timetables', async (req, res) => {
+    console.log("[GET /timetables] Fetching all saved timetables");
+    try {
+        const timetables = await TimetableResult.find({
+          collegeId: req.collegeId,
+          source: { $in: ['manual', 'generator'] }
+        })
+          .sort({ createdAt: -1 })
+          .lean();
+        console.log("[GET /timetables] Found:", timetables.length, "records");
+        res.json(timetables);
+    } catch (e) {
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+protectedRouter.get('/processed-assignments', async (req, res) => {
+    console.log("[GET /processed-assignments] Fetching all saved assignment-only results");
+    try {
+        // The post-find hook on TimetableResult will populate 'populated_assignments'
+        const timetables = await TimetableResult.find({ collegeId: req.collegeId, source: 'assignments' }).sort({ createdAt: -1 });
+        console.log("[GET /processed-assignments] Found:", timetables.length, "records");
+        res.json({ savedTimetables: timetables });
+    } catch (e) {
+        console.error("[GET /processed-assignments] Error:", e);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+protectedRouter.get('/timetable/:id', async (req, res) => {
+    console.log("[GET /timetable/:id] Fetching timetable with id:", req.params.id);
+    try {
+        const timetable = await TimetableResult.findOne({ _id: req.params.id, collegeId: req.collegeId }).lean();
+        if (!timetable) {
+            return res.status(404).json({ error: 'Timetable not found.' });
+        }
+        if (Array.isArray(timetable?.combos)) {
+          const storedSubjectMap = buildSubjectMap(timetable.subjects || []);
+          const missingSubjectIds = new Set();
+          timetable.combos.forEach((combo) => {
+            const subjectId = String(combo?.subject?._id || combo?.subject_id || combo?.subject || "");
+            if (/^[0-9a-fA-F]{24}$/.test(subjectId)) {
+              missingSubjectIds.add(subjectId);
+            }
+            collectSubjectIdsFromEncodedSubjectId(subjectId).forEach((id) => missingSubjectIds.add(id));
+          });
+          const subjectDocs = missingSubjectIds.size
+            ? await Subject.find({ _id: { $in: [...missingSubjectIds] }, collegeId: req.collegeId }).select("name type").lean()
+            : [];
+          const subjectMap = new Map([
+            ...storedSubjectMap.entries(),
+            ...subjectDocs.map((subject) => [String(subject._id), subject]),
+          ]);
+          timetable.combos = timetable.combos.map((combo) => {
+            const subjectId = String(combo?.subject?._id || combo?.subject_id || combo?.subject || "");
+            if (combo?.subject?.name) {
+              return combo;
+            }
+            return {
+              ...combo,
+              subject: {
+                _id: subjectId,
+                name: getComboSubjectDisplayName(combo, subjectMap),
+                type:
+                  combo?.subject?.type ||
+                  subjectMap.get(subjectId)?.type ||
+                  combo?.subject_type ||
+                  combo?.type ||
+                  "theory",
+                isVirtual: Boolean(combo?.subject?.isVirtual || subjectMap.get(subjectId)?.isVirtual),
+              },
+            };
+          });
+        }
+        console.log("[GET /timetable/:id] Found timetable:", timetable.name);
+        res.json(timetable);
+    } catch (e) {
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+protectedRouter.get('/timetable/:id/export/excel', async (req, res) => {
+    try {
+        const mode = String(req.query.mode || 'class').toLowerCase();
+        if (!['class', 'teacher', 'full'].includes(mode)) {
+            return res.status(400).json({ error: 'Invalid export mode.' });
+        }
+
+        const filters = {
+          classId: req.query.classId,
+          facultyId: req.query.facultyId,
+          subjectId: req.query.subjectId,
+        };
+
+        const timetable = await TimetableResult.findOne({ _id: req.params.id, collegeId: req.collegeId }).lean();
+        if (!timetable) {
+            return res.status(404).json({ error: 'Timetable not found.' });
+        }
+
+        const workbook = await exportTimetableExcel({ timetable, mode, filters });
+        const safeName = String(timetable.name || 'timetable')
+          .replace(/[<>:"/\\|?*]+/g, '_')
+          .replace(/\s+/g, '_')
+          .toLowerCase();
+
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${safeName}_${mode}.xlsx"`
+        );
+
+        await workbook.xlsx.write(res);
+        res.end();
+    } catch (e) {
+        console.error('[GET /timetable/:id/export/excel] Error:', e);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+protectedRouter.post('/timetable/export/excel', async (req, res) => {
+    try {
+        const { timetable, mode, filters } = req.body;
+        if (!timetable) {
+            return res.status(400).json({ error: 'Timetable data is required.' });
+        }
+
+        const normalizedMode = String(mode || 'class').toLowerCase();
+        if (!['class', 'teacher', 'full'].includes(normalizedMode)) {
+            return res.status(400).json({ error: 'Invalid export mode.' });
+        }
+
+        const workbook = await exportTimetableExcel({ timetable, mode: normalizedMode, filters });
+        const safeName = String(timetable.name || 'generated_timetable')
+          .replace(/[<>:"/\\|?*]+/g, '_')
+          .replace(/\s+/g, '_')
+          .toLowerCase();
+
+        res.setHeader(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        );
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${safeName}_${normalizedMode}.xlsx"`
+        );
+
+        await workbook.xlsx.write(res);
+        res.end();
+    } catch (e) {
+        console.error('[POST /timetable/export/excel] Error:', e);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+protectedRouter.post("/result/regenerate", async (req, res) => {
+    try {
+      // Load user settings to get inputMode
+      const userSettings = await TimetableUserSettings.findOne({
+        collegeId: req.collegeId,
+        userId: req.user?._id,
+      }).lean();
+
+      const { fixedSlots, constraintConfig = {}, solutionCount } = req.body;
+      const inputMode = userSettings?.inputMode || "EXPLICIT";
+      const daysPerWeek = Number(constraintConfig?.schedule?.daysPerWeek) || 6;
+      const hoursPerDay = Number(constraintConfig?.schedule?.hoursPerDay) || 8;
+  
+      const generatorData = await prepareGeneratorData(req.collegeId, inputMode);
+      const mergedConstraintConfig = mergeTeacherPreferenceConstraintConfig(
+        mergeTeacherAvailabilityConstraintConfig(
+          constraintConfig,
+          generatorData.faculties || []
+        ),
+        generatorData.faculties || []
+      );
+    
+    const { faculties, subjects, classes, combos } = generatorData;
+
+    const {
+      bestClassTimetables,
+      bestFacultyTimetables,
+      bestFacultyDailyHours,
+      bestScore,
+      objectiveValue,
+      config,
+      generation_batch_id,
+      selected_option_id,
+      generation_options,
+    } = await runGenerate({
+      faculties,
+      subjects,
+      classes,
+      combos,
+      fixedSlots,
+      DAYS_PER_WEEK: daysPerWeek,
+      HOURS_PER_DAY: hoursPerDay,
+      constraintConfig: mergedConstraintConfig,
+    });
+
+    if (!bestClassTimetables) {
+      console.warn("[POST /generate] Generation failed: No valid timetable found.");
+      return res.status(400).json({ ok: false, error: "Failed to generate timetable." });
+    }
+
+    const rec = new TimetableResult({
+      collegeId: req.collegeId,
+      name: `Generated Timetable - ${new Date().toLocaleString()}`,
+      source: 'generator',
+      status: 'generated',
+      class_timetables: bestClassTimetables,
+      faculty_timetables: bestFacultyTimetables,
+      faculty_daily_hours: bestFacultyDailyHours,
+      score: bestScore,
+      objective_value: objectiveValue ?? null,
+      generation_batch_id: generation_batch_id ?? null,
+      selected_option_id: selected_option_id ?? null,
+      generation_options: generation_options ?? [],
+      subjects,
+      faculties,
+      combos,
+      config,
+    });
+
+    await rec.save();
+    console.log("[POST /generate] Saved timetable result");
+
+    res.json({
+      ok: true,
+      score: bestScore,
+      class_timetables: bestClassTimetables,
+      faculty_timetables: bestFacultyTimetables,
+      faculty_daily_hours: bestFacultyDailyHours,
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Save a new timetable
+protectedRouter.post("/timetables", async (req, res) => {
+  try {
+    const { name, timetableData } = req.body;
+    if (!name || !timetableData) {
+      return res.status(400).json({ error: "Missing name or timetable data." });
+    }
+
+    const newTimetable = new TimetableResult({
+      collegeId: req.collegeId,
+      name,
+      source: 'generator', // Mark as from the generator
+      status: 'generated',
+      created_by: req.user?._id || null,
+      class_timetables: timetableData.class_timetables,
+      faculty_timetables: timetableData.faculty_timetables,
+      faculty_daily_hours: timetableData.faculty_daily_hours,
+      score: timetableData.score,
+      objective_value: timetableData.objectiveValue ?? timetableData.objective_value ?? null,
+      generation_batch_id: timetableData.generation_batch_id ?? null,
+      selected_option_id: timetableData.selected_option_id ?? null,
+      generation_options: timetableData.generation_options ?? [],
+      subjects: timetableData.subjects,
+      faculties: timetableData.faculties,
+      combos: timetableData.combos,
+      allocations_report: timetableData.allocations_report,
+      config: timetableData.config,
+    });
+
+    const saved = await newTimetable.save();
+    res.status(201).json(saved);
+  } catch (err) {
+    console.error("Error saving timetable:", err);
+    res.status(500).json({ ok: false, error: "Internal Server Error" });
+  }
+});
+
+// Get all generation jobs
+protectedRouter.get('/generations', async (req, res) => {
+  try {
+    const jobs = await GenerationJob.find({ collegeId: req.collegeId })
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json(jobs);
+  } catch (error) {
+    console.error('Error fetching generations:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Delete a generation job and its associated timetables
+protectedRouter.delete('/generations/:id', async (req, res) => {
+  try {
+    const jobId = req.params.id;
+    const collegeId = req.collegeId;
+
+    // Delete the generation job
+    const jobResult = await GenerationJob.deleteOne({ _id: jobId, collegeId });
+    
+    // Also delete any timetables generated from this job
+    const timetableResult = await TimetableResult.deleteMany({
+      collegeId,
+      source_generation_job_id: jobId
+    });
+
+    res.json({
+      ok: true,
+      message: 'Generation job and associated timetables deleted successfully.',
+      deletedJobCount: jobResult.deletedCount,
+      deletedTimetablesCount: timetableResult.deletedCount
+    });
+  } catch (error) {
+    console.error('Error deleting generation:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+export default protectedRouter;
